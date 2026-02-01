@@ -1,0 +1,7 @@
+fastapi
+uvicorn
+yt-dlp
+ytmusicapi
+supabase
+python-multipart
+python-dotenv
