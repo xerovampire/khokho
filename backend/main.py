@@ -124,26 +124,63 @@ def get_stream_url(video_id: str):
         # Get cookies from environment variable (base64 encoded)
         cookies_base64 = os.environ.get('YOUTUBE_COOKIES')
         
+        # More flexible format options - try multiple formats in order
         ydl_opts = {
-            'format': 'bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best',
+            'format': (
+                'bestaudio[ext=m4a]/bestaudio[ext=webm]/'
+                'bestaudio[acodec=opus]/bestaudio[acodec=aac]/'
+                'bestaudio/best[height<=480]/best'
+            ),
             'quiet': True,
             'no_warnings': True,
             'noplaylist': True,
+            'extract_flat': False,
+            'geo_bypass': True,
+            'nocheckcertificate': True,
+            # Add user agent to avoid bot detection
+            'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
         }
         
         # Decode and write cookies if available
         if cookies_base64:
             try:
                 cookies_content = base64.b64decode(cookies_base64).decode('utf-8')
-                with open('/tmp/cookies.txt', 'w') as f:
-                    f.write(cookies_content)
-                ydl_opts['cookiefile'] = '/tmp/cookies.txt'
+                # Filter out non-YouTube cookies
+                filtered_cookies = []
+                for line in cookies_content.split('\n'):
+                    if line.strip() and not line.startswith('#'):
+                        # Only keep google.com and youtube.com cookies
+                        if 'google.com' in line or 'youtube.com' in line:
+                            filtered_cookies.append(line)
+                        
+                if filtered_cookies:
+                    cookies_path = '/tmp/youtube_cookies.txt'
+                    with open(cookies_path, 'w') as f:
+                        f.write('# Netscape HTTP Cookie File\n')
+                        f.write('\n'.join(filtered_cookies))
+                    ydl_opts['cookiefile'] = cookies_path
+                    print(f"Using {len(filtered_cookies)} filtered cookies")
             except Exception as e:
-                print(f"Error decoding cookies: {e}")
+                print(f"Error processing cookies: {e}")
         
         with YoutubeDL(ydl_opts) as ydl:
             url = f"https://www.youtube.com/watch?v={video_id}"
-            info = ydl.extract_info(url, download=False)
+            
+            try:
+                info = ydl.extract_info(url, download=False)
+            except Exception as e:
+                print(f"Primary extraction failed: {e}")
+                # Try without cookies as fallback
+                if 'cookiefile' in ydl_opts:
+                    del ydl_opts['cookiefile']
+                    print("Retrying without cookies...")
+                    with YoutubeDL(ydl_opts) as ydl_retry:
+                        info = ydl_retry.extract_info(url, download=False)
+                else:
+                    raise
+            
+            if not info or not info.get('url'):
+                raise HTTPException(status_code=500, detail="Could not extract stream URL")
             
             data = {
                 "url": info.get('url'),
@@ -160,8 +197,12 @@ def get_stream_url(video_id: str):
             }
             
             return data
+    except HTTPException:
+        raise
     except Exception as e:
         print(f"Error in stream: {e}")
+        import traceback
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
