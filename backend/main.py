@@ -5,6 +5,7 @@ from yt_dlp import YoutubeDL
 import uvicorn
 import os
 import time
+import base64
 
 app = FastAPI()
 
@@ -120,8 +121,8 @@ def get_stream_url(video_id: str):
             else:
                 del stream_cache[video_id]
 
-        # Create cookies file from environment variable
-        cookies_content = os.environ.get('YOUTUBE_COOKIES')
+        # Get cookies from environment variable (base64 encoded)
+        cookies_base64 = os.environ.get('YOUTUBE_COOKIES')
         
         ydl_opts = {
             'format': 'bestaudio/best',
@@ -131,11 +132,15 @@ def get_stream_url(video_id: str):
             'skip_download': True,
         }
         
-        # Add cookies if available
-        if cookies_content:
-            with open('/tmp/cookies.txt', 'w') as f:
-                f.write(cookies_content)
-            ydl_opts['cookiefile'] = '/tmp/cookies.txt'
+        # Decode and write cookies if available
+        if cookies_base64:
+            try:
+                cookies_content = base64.b64decode(cookies_base64).decode('utf-8')
+                with open('/tmp/cookies.txt', 'w') as f:
+                    f.write(cookies_content)
+                ydl_opts['cookiefile'] = '/tmp/cookies.txt'
+            except Exception as e:
+                print(f"Error decoding cookies: {e}")
         
         with YoutubeDL(ydl_opts) as ydl:
             url = f"https://www.youtube.com/watch?v={video_id}"
