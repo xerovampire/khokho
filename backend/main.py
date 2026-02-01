@@ -172,26 +172,22 @@ def get_stream_url(video_id: str):
 
         print(f"🎵 Processing video: {video_id}")
         
-        # Configure yt-dlp options
+        # Configure yt-dlp options with Android client to bypass SABR
         ydl_opts = {
-            'format': (
-                'bestaudio[ext=m4a]/bestaudio[ext=webm]/'
-                'bestaudio/best'
-            ),
-            'quiet': False,  # Show output for debugging
-            'no_warnings': False,
-            'verbose': True,  # Enable verbose logging
+            # Use Android client which doesn't have SABR issues
+            'extractor_args': {
+                'youtube': {
+                    'player_client': ['android', 'web'],
+                    'player_skip': ['webpage', 'configs'],
+                }
+            },
+            'format': 'bestaudio/best',
+            'quiet': True,
+            'no_warnings': True,
             'noplaylist': True,
             'extract_flat': False,
             'geo_bypass': True,
             'nocheckcertificate': True,
-            'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            # Add more headers to look like a real browser
-            'http_headers': {
-                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-                'Accept-Language': 'en-us,en;q=0.5',
-                'Sec-Fetch-Mode': 'navigate',
-            }
         }
         
         # Add cookies if available
@@ -199,7 +195,7 @@ def get_stream_url(video_id: str):
             ydl_opts['cookiefile'] = COOKIES_FILE
             print(f"✅ Using cookies file: {COOKIES_FILE}")
         else:
-            print("⚠️  No cookies file available - some videos may not work")
+            print("⚠️  No cookies file available")
         
         url = f"https://www.youtube.com/watch?v={video_id}"
         
@@ -236,12 +232,36 @@ def get_stream_url(video_id: str):
             if "Sign in to confirm" in error_msg or "bot" in error_msg:
                 raise HTTPException(
                     status_code=403, 
-                    detail="YouTube bot detection triggered. Cookies may be invalid or expired. Please refresh your cookies."
+                    detail="YouTube bot detection triggered. Cookies may be invalid or expired."
                 )
             elif "Video unavailable" in error_msg:
                 raise HTTPException(status_code=404, detail="Video not available")
             elif "Private video" in error_msg:
                 raise HTTPException(status_code=403, detail="Video is private")
+            elif "Requested format is not available" in error_msg:
+                # Try one more time with different client
+                print("⚠️  Retrying with iOS client...")
+                ydl_opts['extractor_args']['youtube']['player_client'] = ['ios', 'android']
+                try:
+                    with YoutubeDL(ydl_opts) as ydl_retry:
+                        info = ydl_retry.extract_info(url, download=False)
+                        if info and info.get('url'):
+                            data = {
+                                "url": info.get('url'),
+                                "title": info.get('title'),
+                                "thumbnail": info.get('thumbnail'),
+                                "artist": info.get('uploader') or info.get('channel'),
+                                "duration": info.get('duration')
+                            }
+                            stream_cache[video_id] = {
+                                'data': data,
+                                'expires': time.time() + 3000
+                            }
+                            print(f"✅ Retry successful: {data['title']}")
+                            return data
+                except:
+                    pass
+                raise HTTPException(status_code=404, detail="No playable formats found for this video")
             else:
                 raise
             
