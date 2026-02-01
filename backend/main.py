@@ -125,7 +125,6 @@ def get_stream_url(video_id: str):
         cookies_base64 = os.environ.get('YOUTUBE_COOKIES')
         
         ydl_opts = {
-            'format': '(bestaudio[acodec=opus]/bestaudio[ext=webm]/bestaudio[ext=m4a]/bestaudio)/best',
             'quiet': True,
             'no_warnings': True,
             'noplaylist': True,
