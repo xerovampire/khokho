@@ -158,6 +158,35 @@ def prepare_cookies_file():
 # Prepare cookies once at startup
 COOKIES_FILE = prepare_cookies_file()
 
+def try_extract_with_client(url, client_name, cookies_file=None):
+    """Try to extract video info with a specific client"""
+    ydl_opts = {
+        'format': 'bestaudio/best',
+        'quiet': True,
+        'no_warnings': True,
+        'noplaylist': True,
+        'extract_flat': False,
+        'extractor_args': {
+            'youtube': {
+                'player_client': [client_name],
+                'player_skip': ['configs', 'webpage'],
+            }
+        }
+    }
+    
+    if cookies_file:
+        ydl_opts['cookiefile'] = cookies_file
+    
+    try:
+        with YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            if info and info.get('url'):
+                return info
+    except Exception as e:
+        print(f"  ⚠️  {client_name} client failed: {str(e)[:100]}")
+    
+    return None
+
 @app.get("/stream/{video_id}")
 def get_stream_url(video_id: str):
     try:
@@ -171,99 +200,53 @@ def get_stream_url(video_id: str):
                 del stream_cache[video_id]
 
         print(f"🎵 Processing video: {video_id}")
-        
-        # Configure yt-dlp options with Android client to bypass SABR
-        ydl_opts = {
-            # Use Android client which doesn't have SABR issues
-            'extractor_args': {
-                'youtube': {
-                    'player_client': ['android', 'web'],
-                    'player_skip': ['webpage', 'configs'],
-                }
-            },
-            'format': 'bestaudio/best',
-            'quiet': True,
-            'no_warnings': True,
-            'noplaylist': True,
-            'extract_flat': False,
-            'geo_bypass': True,
-            'nocheckcertificate': True,
-        }
-        
-        # Add cookies if available
-        if COOKIES_FILE and os.path.exists(COOKIES_FILE):
-            ydl_opts['cookiefile'] = COOKIES_FILE
-            print(f"✅ Using cookies file: {COOKIES_FILE}")
-        else:
-            print("⚠️  No cookies file available")
-        
         url = f"https://www.youtube.com/watch?v={video_id}"
         
-        try:
-            with YoutubeDL(ydl_opts) as ydl:
-                print(f"📥 Extracting info for: {url}")
-                info = ydl.extract_info(url, download=False)
-                
-                if not info or not info.get('url'):
-                    raise HTTPException(status_code=500, detail="Could not extract stream URL")
-                
-                data = {
-                    "url": info.get('url'),
-                    "title": info.get('title'),
-                    "thumbnail": info.get('thumbnail'),
-                    "artist": info.get('uploader') or info.get('channel'),
-                    "duration": info.get('duration')
-                }
-                
-                # Cache for 50 minutes (URLs typically expire after 1 hour)
-                stream_cache[video_id] = {
-                    'data': data,
-                    'expires': time.time() + 3000
-                }
-                
-                print(f"✅ Successfully extracted: {data['title']}")
-                return data
-                
-        except Exception as e:
-            error_msg = str(e)
-            print(f"❌ Extraction failed: {error_msg}")
-            
-            # Provide helpful error messages
-            if "Sign in to confirm" in error_msg or "bot" in error_msg:
-                raise HTTPException(
-                    status_code=403, 
-                    detail="YouTube bot detection triggered. Cookies may be invalid or expired."
-                )
-            elif "Video unavailable" in error_msg:
-                raise HTTPException(status_code=404, detail="Video not available")
-            elif "Private video" in error_msg:
-                raise HTTPException(status_code=403, detail="Video is private")
-            elif "Requested format is not available" in error_msg:
-                # Try one more time with different client
-                print("⚠️  Retrying with iOS client...")
-                ydl_opts['extractor_args']['youtube']['player_client'] = ['ios', 'android']
-                try:
-                    with YoutubeDL(ydl_opts) as ydl_retry:
-                        info = ydl_retry.extract_info(url, download=False)
-                        if info and info.get('url'):
-                            data = {
-                                "url": info.get('url'),
-                                "title": info.get('title'),
-                                "thumbnail": info.get('thumbnail'),
-                                "artist": info.get('uploader') or info.get('channel'),
-                                "duration": info.get('duration')
-                            }
-                            stream_cache[video_id] = {
-                                'data': data,
-                                'expires': time.time() + 3000
-                            }
-                            print(f"✅ Retry successful: {data['title']}")
-                            return data
-                except:
-                    pass
-                raise HTTPException(status_code=404, detail="No playable formats found for this video")
-            else:
-                raise
+        # Try multiple clients in order of success rate
+        clients_to_try = [
+            ('android_music', COOKIES_FILE),      # Best for music
+            ('android', COOKIES_FILE),             # Good general fallback
+            ('ios', COOKIES_FILE),                 # iOS music app
+            ('mweb', COOKIES_FILE),                # Mobile web
+            ('android_music', None),               # Try without cookies
+            ('android', None),
+        ]
+        
+        info = None
+        successful_client = None
+        
+        print(f"🔄 Trying multiple clients for {video_id}...")
+        for client, cookies in clients_to_try:
+            print(f"  🔧 Attempting with {client} client{'(with cookies)' if cookies else '(no cookies)'}")
+            info = try_extract_with_client(url, client, cookies)
+            if info and info.get('url'):
+                successful_client = client
+                print(f"  ✅ Success with {client} client!")
+                break
+        
+        if not info or not info.get('url'):
+            print(f"❌ All clients failed for {video_id}")
+            raise HTTPException(
+                status_code=503, 
+                detail="YouTube is currently blocking requests from this server. This is usually temporary. Try again in a few minutes."
+            )
+        
+        data = {
+            "url": info.get('url'),
+            "title": info.get('title'),
+            "thumbnail": info.get('thumbnail'),
+            "artist": info.get('uploader') or info.get('channel') or info.get('artist'),
+            "duration": info.get('duration')
+        }
+        
+        # Cache for 45 minutes
+        stream_cache[video_id] = {
+            'data': data,
+            'expires': time.time() + 2700
+        }
+        
+        print(f"✅ Successfully extracted: {data['title']} (via {successful_client})")
+        return data
             
     except HTTPException:
         raise
