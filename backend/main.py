@@ -4,6 +4,7 @@ from ytmusicapi import YTMusic
 from yt_dlp import YoutubeDL
 import uvicorn
 import os
+import time
 
 app = FastAPI()
 
@@ -56,7 +57,6 @@ def get_charts():
 
 # Simple in-memory cache: {video_id: {'url': ..., 'expires': timestamp}}
 stream_cache = {}
-import time
 
 @app.get("/suggestions")
 def get_suggestions(q: str = ""):
@@ -120,6 +120,9 @@ def get_stream_url(video_id: str):
             else:
                 del stream_cache[video_id]
 
+        # Create cookies file from environment variable
+        cookies_content = os.environ.get('YOUTUBE_COOKIES')
+        
         ydl_opts = {
             'format': 'bestaudio/best',
             'quiet': True,
@@ -127,6 +130,13 @@ def get_stream_url(video_id: str):
             'noplaylist': True,
             'skip_download': True,
         }
+        
+        # Add cookies if available
+        if cookies_content:
+            with open('/tmp/cookies.txt', 'w') as f:
+                f.write(cookies_content)
+            ydl_opts['cookiefile'] = '/tmp/cookies.txt'
+        
         with YoutubeDL(ydl_opts) as ydl:
             url = f"https://www.youtube.com/watch?v={video_id}"
             info = ydl.extract_info(url, download=False)
