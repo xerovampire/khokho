@@ -128,7 +128,8 @@ def get_stream_url(video_id: str):
             'quiet': True,
             'no_warnings': True,
             'noplaylist': True,
-            'skip_download': True,
+            'extract_flat': False,
+            'format': 'best',  # Try 'best' instead of 'bestaudio'
         }
         
         # Decode and write cookies if available
@@ -144,8 +145,29 @@ def get_stream_url(video_id: str):
         with YoutubeDL(ydl_opts) as ydl:
             url = f"https://www.youtube.com/watch?v={video_id}"
             info = ydl.extract_info(url, download=False)
+            
+            # Try to find the best audio URL from formats
+            audio_url = None
+            if 'formats' in info:
+                # Look for audio-only formats
+                for fmt in reversed(info['formats']):
+                    if fmt.get('acodec') != 'none' and fmt.get('vcodec') == 'none':
+                        audio_url = fmt.get('url')
+                        break
+                
+                # If no audio-only, just take any format with audio
+                if not audio_url:
+                    for fmt in reversed(info['formats']):
+                        if fmt.get('acodec') != 'none':
+                            audio_url = fmt.get('url')
+                            break
+            
+            # Fallback to main URL
+            if not audio_url:
+                audio_url = info.get('url')
+            
             data = {
-                "url": info.get('url'),
+                "url": audio_url,
                 "title": info.get('title'),
                 "thumbnail": info.get('thumbnail'),
                 "artist": info.get('uploader'),
