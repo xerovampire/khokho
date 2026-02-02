@@ -1,8 +1,0 @@
-fastapi
-uvicorn
-httpx
-pytubefix
-ytmusicapi
-supabase
-python-multipart
-python-dotenv
