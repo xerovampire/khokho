@@ -107,16 +107,24 @@ def get_related(video_id: str, limit: int = 20):
         print(f"Error getting radio tracks: {e}")
         return []
 
-# Invidious instances to try (ordered by reliability)
+# Updated working Invidious instances (as of Feb 2026)
 INVIDIOUS_INSTANCES = [
-    "https://invidious.privacydev.net",
-    "https://inv.nadeko.net",
-    "https://invidious.nerdvpn.de",
-    "https://vid.puffyan.us",
-    "https://invidious.projectsegfau.lt",
-    "https://inv.riverside.rocks",
-    "https://yt.artemislena.eu",
-    "https://invidious.slipfox.xyz"
+    "https://iv.nboeck.de",
+    "https://invidious.fdn.fr",
+    "https://inv.tux.pizza",
+    "https://invidious.perennialte.ch",
+    "https://yt.cdaut.de",
+    "https://invidious.drgns.space",
+    "https://inv.us.projectsegfau.lt",
+    "https://invidious.protokolla.fi"
+]
+
+# Piped instances as backup
+PIPED_INSTANCES = [
+    "https://pipedapi.kavin.rocks",
+    "https://api-piped.mha.fi",
+    "https://pipedapi.palveluntarjoaja.eu",
+    "https://piped-api.garudalinux.org"
 ]
 
 async def get_stream_from_invidious(video_id: str):
@@ -124,16 +132,15 @@ async def get_stream_from_invidious(video_id: str):
     
     for instance in INVIDIOUS_INSTANCES:
         try:
-            print(f"  ðŸ”§ Trying Invidious instance: {instance}")
+            print(f"  ðŸ”§ Trying Invidious: {instance}")
             
-            async with httpx.AsyncClient(timeout=15.0) as client:
+            async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
                 response = await client.get(
                     f"{instance}/api/v1/videos/{video_id}",
                     params={"fields": "title,author,lengthSeconds,adaptiveFormats,videoThumbnails"}
                 )
                 
                 if response.status_code != 200:
-                    print(f"  âš ï¸  Instance returned status {response.status_code}")
                     continue
                 
                 data = response.json()
@@ -145,7 +152,6 @@ async def get_stream_from_invidious(video_id: str):
                 ]
                 
                 if not audio_formats:
-                    print(f"  âš ï¸  No audio formats found")
                     continue
                 
                 # Get best quality audio (highest bitrate)
@@ -155,12 +161,8 @@ async def get_stream_from_invidious(video_id: str):
                 thumbnails = data.get('videoThumbnails', [])
                 thumbnail_url = None
                 if thumbnails:
-                    # Try to get high quality thumbnail
                     hq_thumbnails = [t for t in thumbnails if t.get('quality') in ['maxres', 'maxresdefault', 'high']]
-                    if hq_thumbnails:
-                        thumbnail_url = hq_thumbnails[0]['url']
-                    else:
-                        thumbnail_url = thumbnails[0]['url']
+                    thumbnail_url = hq_thumbnails[0]['url'] if hq_thumbnails else thumbnails[0]['url']
                 
                 result = {
                     "url": best_audio['url'],
@@ -170,15 +172,94 @@ async def get_stream_from_invidious(video_id: str):
                     "duration": data.get('lengthSeconds')
                 }
                 
-                print(f"  âœ… Success with {instance}")
+                print(f"  âœ… Success with Invidious: {instance}")
                 return result
                 
-        except httpx.TimeoutException:
-            print(f"  âš ï¸  Instance {instance} timed out")
-            continue
         except Exception as e:
-            print(f"  âš ï¸  Instance {instance} failed: {str(e)[:100]}")
+            print(f"  âš ï¸  Invidious {instance}: {str(e)[:80]}")
             continue
+    
+    return None
+
+async def get_stream_from_piped(video_id: str):
+    """Try Piped API instances as fallback"""
+    
+    for instance in PIPED_INSTANCES:
+        try:
+            print(f"  ðŸ”§ Trying Piped: {instance}")
+            
+            async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
+                response = await client.get(f"{instance}/streams/{video_id}")
+                
+                if response.status_code != 200:
+                    continue
+                
+                data = response.json()
+                
+                # Get best audio stream
+                audio_streams = data.get('audioStreams', [])
+                if not audio_streams:
+                    continue
+                
+                # Sort by quality/bitrate
+                best_audio = max(audio_streams, key=lambda x: x.get('bitrate', 0))
+                
+                result = {
+                    "url": best_audio['url'],
+                    "title": data.get('title'),
+                    "thumbnail": data.get('thumbnailUrl'),
+                    "artist": data.get('uploader'),
+                    "duration": data.get('duration')
+                }
+                
+                print(f"  âœ… Success with Piped: {instance}")
+                return result
+                
+        except Exception as e:
+            print(f"  âš ï¸  Piped {instance}: {str(e)[:80]}")
+            continue
+    
+    return None
+
+async def get_stream_from_ytdlp(video_id: str):
+    """Fallback to yt-dlp with optimized settings"""
+    try:
+        print(f"  ðŸ”§ Trying yt-dlp as last resort")
+        from yt_dlp import YoutubeDL
+        
+        url = f"https://www.youtube.com/watch?v={video_id}"
+        
+        ydl_opts = {
+            'format': 'bestaudio/best',
+            'quiet': True,
+            'no_warnings': True,
+            'noplaylist': True,
+            'extract_flat': False,
+            'extractor_args': {
+                'youtube': {
+                    'player_client': ['android_music', 'android', 'ios'],
+                    'player_skip': ['configs', 'webpage'],
+                }
+            },
+            'socket_timeout': 10,
+        }
+        
+        with YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            
+            if info and info.get('url'):
+                result = {
+                    "url": info.get('url'),
+                    "title": info.get('title'),
+                    "thumbnail": info.get('thumbnail'),
+                    "artist": info.get('uploader') or info.get('channel') or info.get('artist'),
+                    "duration": info.get('duration')
+                }
+                print(f"  âœ… Success with yt-dlp")
+                return result
+                
+    except Exception as e:
+        print(f"  âš ï¸  yt-dlp failed: {str(e)[:80]}")
     
     return None
 
@@ -196,20 +277,33 @@ async def get_stream_url(video_id: str):
 
         print(f"ðŸŽµ Processing video: {video_id}")
         
-        # Try to get stream from Invidious
+        # Try methods in order: Invidious â†’ Piped â†’ yt-dlp
+        data = None
+        
+        # Try Invidious first (fastest, most reliable)
         data = await get_stream_from_invidious(video_id)
         
+        # Try Piped if Invidious failed
         if not data:
-            print(f"âŒ All Invidious instances failed for {video_id}")
+            print(f"âš ï¸  Invidious failed, trying Piped...")
+            data = await get_stream_from_piped(video_id)
+        
+        # Try yt-dlp as last resort
+        if not data:
+            print(f"âš ï¸  Piped failed, trying yt-dlp...")
+            data = await get_stream_from_ytdlp(video_id)
+        
+        if not data:
+            print(f"âŒ All methods failed for {video_id}")
             raise HTTPException(
                 status_code=503, 
-                detail="Unable to fetch stream. All proxy servers are currently unavailable. Please try again in a few moments."
+                detail="Unable to fetch stream. All proxy servers are temporarily unavailable. Please try again in a moment."
             )
         
-        # Cache for 45 minutes (stream URLs typically expire after 6 hours but we refresh earlier)
+        # Cache for 30 minutes
         stream_cache[video_id] = {
             'data': data,
-            'expires': time.time() + 2700
+            'expires': time.time() + 1800
         }
         
         print(f"âœ… Successfully extracted: {data['title']}")
