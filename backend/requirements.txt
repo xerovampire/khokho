@@ -1,6 +1,7 @@
 fastapi
 uvicorn
 httpx
+yt-dlp
 ytmusicapi
 supabase
 python-multipart
