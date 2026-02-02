@@ -1,114 +1,240 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 import httpx
 import uvicorn
 import time
 import os
+from typing import Optional, List, Dict, Any
 
-app = FastAPI()
+app = FastAPI(title="Music Streamer Backend")
 
-# Allow CORS for frontend
+# CORS Configuration
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # In production, restrict to frontend URL
+    allow_origins=[
+        "https://lolaaaaa.netlify.app",
+        "http://localhost:3000",
+        "http://localhost:5173",
+        "*"
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Amazon Music API - Production server
+# Amazon Music API Configuration
 AMAZON_MUSIC_API = os.getenv("AMAZON_MUSIC_API_URL", "https://amz.dezalty.com")
-# Auth token is optional - API works without auth for basic operations
 AMAZON_AUTH_TOKEN = os.getenv("AMAZON_AUTH_TOKEN", "")
 
-# Helper function to transform Amazon Music data to YouTube Music format
-def transform_track(amz_track):
-    """Transform Amazon Music track format to match YouTube Music format"""
-    return {
-        "videoId": amz_track.get("id"),
-        "title": amz_track.get("title") or amz_track.get("name"),
-        "artists": [
-            {"name": artist.get("name"), "id": artist.get("id")} 
-            for artist in amz_track.get("artists", [])
-        ] if isinstance(amz_track.get("artists"), list) else [
-            {"name": amz_track.get("artist", "Unknown"), "id": None}
-        ],
-        "album": {
-            "name": amz_track.get("album", {}).get("title") if isinstance(amz_track.get("album"), dict) else amz_track.get("album"),
-            "id": amz_track.get("album", {}).get("id") if isinstance(amz_track.get("album"), dict) else None
-        },
-        "duration": amz_track.get("duration"),
-        "duration_seconds": amz_track.get("duration"),
-        "thumbnails": [
-            {"url": amz_track.get("cover") or amz_track.get("image"), "width": 500, "height": 500}
-        ] if amz_track.get("cover") or amz_track.get("image") else [],
-        "isExplicit": amz_track.get("explicit", False),
-        "year": amz_track.get("year")
-    }
+# Cache
+stream_cache: Dict[str, Dict[str, Any]] = {}
+CACHE_DURATION = 3600
 
+def get_headers() -> dict:
+    """Get standard headers for API requests"""
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Accept": "application/json",
+    }
+    if AMAZON_AUTH_TOKEN:
+        headers["Authorization"] = f"Bearer {AMAZON_AUTH_TOKEN}"
+    return headers
+
+def transform_track(amz_track: dict) -> dict:
+    """
+    Transform Amazon Music track to frontend-compatible format.
+    CRITICAL: All nested objects must be converted to strings or primitives
+    to avoid React "Objects are not valid as a React child" error.
+    """
+    try:
+        # Extract artists - CONVERT TO ARRAY OF OBJECTS WITH STRING VALUES ONLY
+        artists = []
+        if isinstance(amz_track.get("artists"), list):
+            for artist in amz_track.get("artists", []):
+                if isinstance(artist, dict):
+                    artists.append({
+                        "name": str(artist.get("name", "Unknown")),
+                        "id": str(artist.get("id", "") or artist.get("asin", ""))
+                    })
+                elif isinstance(artist, str):
+                    artists.append({"name": artist, "id": ""})
+        elif isinstance(amz_track.get("artist"), dict):
+            # If artist is an object like {name, asin, id, url}
+            artist_obj = amz_track.get("artist")
+            artists.append({
+                "name": str(artist_obj.get("name", "Unknown")),
+                "id": str(artist_obj.get("id", "") or artist_obj.get("asin", ""))
+            })
+        elif isinstance(amz_track.get("artist"), str):
+            artists.append({"name": amz_track.get("artist"), "id": ""})
+        
+        if not artists:
+            artists = [{"name": "Unknown Artist", "id": ""}]
+
+        # Extract album - CONVERT TO OBJECT WITH STRING VALUES ONLY
+        album_data = amz_track.get("album", {})
+        if isinstance(album_data, dict):
+            album = {
+                "name": str(album_data.get("title", "") or album_data.get("name", "") or "Unknown Album"),
+                "id": str(album_data.get("id", "") or album_data.get("asin", "") or "")
+            }
+        elif isinstance(album_data, str):
+            album = {"name": album_data, "id": ""}
+        else:
+            album = {"name": "Unknown Album", "id": ""}
+
+        # Extract thumbnails - ENSURE URL IS A STRING
+        thumbnails = []
+        cover_url = (
+            amz_track.get("cover") or 
+            amz_track.get("image") or 
+            amz_track.get("artwork") or
+            amz_track.get("thumbnail")
+        )
+        if cover_url:
+            thumbnails = [{"url": str(cover_url), "width": 500, "height": 500}]
+
+        # Extract track ID - MUST BE STRING
+        track_id = (
+            amz_track.get("id") or 
+            amz_track.get("trackId") or 
+            amz_track.get("asin") or 
+            ""
+        )
+
+        # Extract title - MUST BE STRING
+        title = (
+            amz_track.get("title") or 
+            amz_track.get("name") or 
+            "Unknown Title"
+        )
+
+        # Extract duration - CONVERT TO NUMBER OR NULL
+        duration = amz_track.get("duration") or amz_track.get("durationSeconds")
+        if duration:
+            try:
+                duration = int(duration)
+            except (ValueError, TypeError):
+                duration = None
+
+        return {
+            "videoId": str(track_id),
+            "title": str(title),
+            "artists": artists,  # Array of {name: string, id: string}
+            "album": album,  # {name: string, id: string}
+            "duration": duration,  # number or null
+            "duration_seconds": duration,  # number or null
+            "thumbnails": thumbnails,  # Array of {url: string, width: number, height: number}
+            "isExplicit": bool(amz_track.get("explicit", False)),
+            "year": amz_track.get("year") or amz_track.get("releaseYear") or None
+        }
+    except Exception as e:
+        print(f"⚠️ Error transforming track: {e}")
+        print(f"Raw track data: {amz_track}")
+        # Return minimal valid structure with all strings
+        return {
+            "videoId": str(amz_track.get("id", "") or amz_track.get("asin", "") or "unknown"),
+            "title": "Unknown",
+            "artists": [{"name": "Unknown", "id": ""}],
+            "album": {"name": "Unknown", "id": ""},
+            "duration": None,
+            "duration_seconds": None,
+            "thumbnails": [],
+            "isExplicit": False,
+            "year": None
+        }
+
+@app.get("/")
 @app.get("/info")
 def info():
-    return {"status": "ok", "service": "Music Streamer Backend (Amazon Music)"}
+    """Health check endpoint"""
+    return {
+        "status": "ok", 
+        "service": "Music Streamer Backend",
+        "version": "1.0.1",
+        "amazon_api": AMAZON_MUSIC_API,
+        "timestamp": int(time.time())
+    }
 
 @app.get("/search")
 async def search(q: str):
+    """Search for tracks via Amazon Music API"""
+    if not q or len(q.strip()) == 0:
+        return []
+    
     try:
+        print(f"🔍 Search request: '{q}'")
+        
         async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as client:
-            headers = {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-            }
-            if AMAZON_AUTH_TOKEN:
-                headers["Authorization"] = f"Bearer {AMAZON_AUTH_TOKEN}"
-            
-            # Amazon Music API search endpoint
             response = await client.get(
                 f"{AMAZON_MUSIC_API}/search",
                 params={"query": q, "type": "track"},
-                headers=headers
+                headers=get_headers()
             )
             
-            print(f"Search API response status: {response.status_code}")
+            print(f"📡 Search API response: {response.status_code}")
             
             if response.status_code != 200:
-                print(f"Amazon Music API error: {response.status_code}, body: {response.text[:200]}")
-                raise HTTPException(status_code=500, detail=f"Amazon Music API returned {response.status_code}")
+                print(f"❌ API Error: {response.status_code}")
+                return []
             
             data = response.json()
-            print(f"Search response keys: {data.keys() if isinstance(data, dict) else 'not a dict'}")
             
             # Handle different response formats
             tracks = []
             if isinstance(data, dict):
-                tracks = data.get("tracks", []) or data.get("results", []) or data.get("data", [])
+                # Try different possible keys
+                tracks = (
+                    data.get("tracks") or 
+                    data.get("results") or 
+                    data.get("data") or 
+                    data.get("items") or
+                    []
+                )
             elif isinstance(data, list):
                 tracks = data
             
             if not tracks:
-                print("No tracks found in response")
+                print("⚠️ No tracks found in response")
                 return []
             
-            print(f"Found {len(tracks)} tracks")
-            return [transform_track(track) for track in tracks[:20]]
+            print(f"✅ Found {len(tracks)} tracks")
             
-    except httpx.HTTPError as e:
-        print(f"HTTP Error in search: {e}")
-        raise HTTPException(status_code=503, detail="Amazon Music API unavailable")
+            # Transform tracks and filter out invalid ones
+            transformed = []
+            for track in tracks[:20]:
+                try:
+                    t = transform_track(track)
+                    if t.get("videoId") and t.get("videoId") != "unknown":
+                        transformed.append(t)
+                except Exception as e:
+                    print(f"⚠️ Skipping track due to transform error: {e}")
+                    continue
+            
+            print(f"✅ Returning {len(transformed)} valid tracks")
+            return transformed
+            
+    except httpx.TimeoutException:
+        print("⏱️ Request timeout")
+        return []
+    except httpx.ConnectError as e:
+        print(f"🔌 Connection error: {e}")
+        return []
     except Exception as e:
-        print(f"Error in search: {e}")
+        print(f"❌ Unexpected error in search: {e}")
         import traceback
         traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
+        return []
 
 @app.get("/charts")
 async def get_charts():
+    """Get trending/popular tracks"""
     try:
-        # Use trending/popular searches as "charts"
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            headers = {}
-            if AMAZON_AUTH_TOKEN:
-                headers["Authorization"] = f"Bearer {AMAZON_AUTH_TOKEN}"
-            
-            queries = ["Top 100", "Trending songs", "Popular hits"]
+        print("📊 Fetching charts...")
+        
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            queries = ["Top 100", "Trending", "Popular 2024"]
             all_tracks = []
             
             for query in queries:
@@ -116,40 +242,55 @@ async def get_charts():
                     response = await client.get(
                         f"{AMAZON_MUSIC_API}/search",
                         params={"query": query, "type": "track"},
-                        headers=headers
+                        headers=get_headers()
                     )
                     
                     if response.status_code == 200:
                         data = response.json()
-                        tracks = data.get("tracks", []) or data.get("results", []) or data.get("data", [])
-                        all_tracks.extend([transform_track(track) for track in tracks[:10]])
+                        tracks = (
+                            data.get("tracks") or 
+                            data.get("results") or 
+                            data.get("data") or 
+                            []
+                        )
+                        for track in tracks[:10]:
+                            try:
+                                t = transform_track(track)
+                                if t.get("videoId") and t.get("videoId") != "unknown":
+                                    all_tracks.append(t)
+                            except:
+                                continue
                     
                     if len(all_tracks) >= 20:
                         break
-                except:
+                        
+                except Exception as e:
+                    print(f"Error fetching charts for '{query}': {e}")
                     continue
             
             # Remove duplicates
             seen = set()
             unique_tracks = []
             for track in all_tracks:
-                if track["videoId"] not in seen:
-                    seen.add(track["videoId"])
+                vid_id = track.get("videoId")
+                if vid_id and vid_id not in seen:
+                    seen.add(vid_id)
                     unique_tracks.append(track)
             
-            return unique_tracks[:20] if unique_tracks else []
+            result = unique_tracks[:20]
+            print(f"✅ Returning {len(result)} chart tracks")
+            return result
             
     except Exception as e:
-        print(f"Error in charts: {e}")
+        print(f"❌ Error in charts: {e}")
         return []
-
-# Simple in-memory cache
-stream_cache = {}
 
 @app.get("/suggestions")
 async def get_suggestions(q: str = ""):
+    """Get search suggestions"""
     try:
-        if not q:
+        if not q or len(q.strip()) == 0:
+            # Return genre suggestions
             return {
                 "queries": [],
                 "results": [
@@ -163,23 +304,32 @@ async def get_suggestions(q: str = ""):
             }
         
         async with httpx.AsyncClient(timeout=15.0) as client:
-            headers = {}
-            if AMAZON_AUTH_TOKEN:
-                headers["Authorization"] = f"Bearer {AMAZON_AUTH_TOKEN}"
-            
             response = await client.get(
                 f"{AMAZON_MUSIC_API}/search",
                 params={"query": q, "type": "track"},
-                headers=headers
+                headers=get_headers()
             )
             
             if response.status_code != 200:
                 return {"queries": [], "results": []}
             
             data = response.json()
-            tracks = data.get("tracks", []) or data.get("results", []) or data.get("data", [])
+            tracks = (
+                data.get("tracks") or 
+                data.get("results") or 
+                data.get("data") or 
+                []
+            )
             
-            transformed_tracks = [transform_track(track) for track in tracks[:5]]
+            transformed_tracks = []
+            for track in tracks[:5]:
+                try:
+                    t = transform_track(track)
+                    if t.get("videoId") and t.get("videoId") != "unknown":
+                        transformed_tracks.append(t)
+                except:
+                    continue
+            
             queries = [q, f"{q} songs", f"{q} hits"][:3]
             
             return {
@@ -193,16 +343,13 @@ async def get_suggestions(q: str = ""):
 
 @app.get("/artist/{browse_id}")
 async def get_artist(browse_id: str):
+    """Get artist information"""
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
-            headers = {}
-            if AMAZON_AUTH_TOKEN:
-                headers["Authorization"] = f"Bearer {AMAZON_AUTH_TOKEN}"
-            
             response = await client.get(
                 f"{AMAZON_MUSIC_API}/artist",
                 params={"id": browse_id},
-                headers=headers
+                headers=get_headers()
             )
             
             if response.status_code != 200:
@@ -212,11 +359,11 @@ async def get_artist(browse_id: str):
             artist = data.get("artist") or data.get("data") or data
             
             return {
-                "name": artist.get("name"),
-                "description": artist.get("bio") or artist.get("description"),
+                "name": str(artist.get("name", "Unknown")),
+                "description": str(artist.get("bio", "") or artist.get("description", "") or ""),
                 "views": artist.get("followers"),
-                "thumbnails": [{"url": artist.get("image") or artist.get("cover")}],
-                "songs": {"browseId": browse_id}
+                "thumbnails": [{"url": str(artist.get("image", "") or artist.get("cover", ""))}],
+                "songs": {"browseId": str(browse_id)}
             }
             
     except HTTPException:
@@ -227,41 +374,54 @@ async def get_artist(browse_id: str):
 
 @app.get("/related/{video_id}")
 async def get_related(video_id: str, limit: int = 20):
+    """Get related tracks"""
     try:
-        # Amazon Music API might not have a direct "related" endpoint
-        # Try to get similar tracks based on the current track's artist/genre
         async with httpx.AsyncClient(timeout=15.0) as client:
-            headers = {}
-            if AMAZON_AUTH_TOKEN:
-                headers["Authorization"] = f"Bearer {AMAZON_AUTH_TOKEN}"
-            
-            # First get the track details
+            # Get track details first
             track_response = await client.get(
                 f"{AMAZON_MUSIC_API}/track",
                 params={"id": video_id},
-                headers=headers
+                headers=get_headers()
             )
             
             if track_response.status_code == 200:
                 track_data = track_response.json()
                 track = track_data.get("track") or track_data.get("data") or track_data
                 
-                # Search for similar tracks by artist
-                artist_name = track.get("artist") or (track.get("artists", [{}])[0].get("name") if track.get("artists") else "")
+                # Get artist name
+                artist_name = ""
+                if isinstance(track.get("artist"), dict):
+                    artist_name = track.get("artist", {}).get("name", "")
+                elif isinstance(track.get("artist"), str):
+                    artist_name = track.get("artist")
+                elif track.get("artists") and len(track.get("artists", [])) > 0:
+                    first_artist = track.get("artists")[0]
+                    if isinstance(first_artist, dict):
+                        artist_name = first_artist.get("name", "")
+                    elif isinstance(first_artist, str):
+                        artist_name = first_artist
                 
                 if artist_name:
                     search_response = await client.get(
                         f"{AMAZON_MUSIC_API}/search",
                         params={"query": artist_name, "type": "track"},
-                        headers=headers
+                        headers=get_headers()
                     )
                     
                     if search_response.status_code == 200:
                         data = search_response.json()
-                        tracks = data.get("tracks", []) or data.get("results", []) or data.get("data", [])
-                        related = [transform_track(t) for t in tracks[:limit]]
-                        # Filter out the current track
-                        return [t for t in related if t["videoId"] != video_id][:limit]
+                        tracks = data.get("tracks") or data.get("results") or data.get("data") or []
+                        related = []
+                        for t in tracks[:limit + 5]:
+                            try:
+                                transformed = transform_track(t)
+                                if (transformed.get("videoId") and 
+                                    transformed.get("videoId") != "unknown" and
+                                    transformed.get("videoId") != video_id):
+                                    related.append(transformed)
+                            except:
+                                continue
+                        return related[:limit]
             
             return []
             
@@ -271,6 +431,7 @@ async def get_related(video_id: str, limit: int = 20):
 
 @app.get("/stream/{video_id}")
 async def get_stream_url(video_id: str):
+    """Get streaming URL for a track"""
     try:
         # Check cache
         if video_id in stream_cache:
@@ -281,22 +442,18 @@ async def get_stream_url(video_id: str):
             else:
                 del stream_cache[video_id]
 
-        print(f"🎵 Fetching track: {video_id}")
+        print(f"🎵 Fetching stream for: {video_id}")
         
         async with httpx.AsyncClient(timeout=15.0) as client:
-            headers = {}
-            if AMAZON_AUTH_TOKEN:
-                headers["Authorization"] = f"Bearer {AMAZON_AUTH_TOKEN}"
-            
             # Get streaming URLs
             response = await client.get(
                 f"{AMAZON_MUSIC_API}/stream_urls",
                 params={"id": video_id},
-                headers=headers
+                headers=get_headers()
             )
             
             if response.status_code != 200:
-                raise HTTPException(status_code=404, detail="Track not found or streaming unavailable")
+                raise HTTPException(status_code=404, detail="Track not found")
             
             data = response.json()
             
@@ -304,7 +461,7 @@ async def get_stream_url(video_id: str):
             track_response = await client.get(
                 f"{AMAZON_MUSIC_API}/track",
                 params={"id": video_id},
-                headers=headers
+                headers=get_headers()
             )
             
             track_info = {}
@@ -312,13 +469,12 @@ async def get_stream_url(video_id: str):
                 track_data = track_response.json()
                 track_info = track_data.get("track") or track_data.get("data") or track_data
             
-            # Extract the best quality stream URL
-            # Format depends on the actual API response
+            # Extract stream URL
             stream_url = None
             urls = data.get("urls") or data.get("stream_urls") or data
             
             # Try different quality levels
-            for quality in ["High", "Normal", "Medium"]:
+            for quality in ["High", "Normal", "Medium", "Low"]:
                 if isinstance(urls, dict) and quality in urls:
                     stream_url = urls[quality]
                     break
@@ -329,21 +485,34 @@ async def get_stream_url(video_id: str):
             if not stream_url:
                 raise HTTPException(status_code=404, detail="No stream URL available")
             
+            # Extract artist name safely
+            artist_name = "Unknown"
+            if isinstance(track_info.get("artist"), dict):
+                artist_name = track_info.get("artist", {}).get("name", "Unknown")
+            elif isinstance(track_info.get("artist"), str):
+                artist_name = track_info.get("artist")
+            elif track_info.get("artists") and len(track_info.get("artists", [])) > 0:
+                first_artist = track_info.get("artists")[0]
+                if isinstance(first_artist, dict):
+                    artist_name = first_artist.get("name", "Unknown")
+                elif isinstance(first_artist, str):
+                    artist_name = first_artist
+            
             result = {
-                "url": stream_url,
-                "title": track_info.get("title") or track_info.get("name", "Unknown"),
-                "thumbnail": track_info.get("cover") or track_info.get("image"),
-                "artist": track_info.get("artist") or (track_info.get("artists", [{}])[0].get("name") if track_info.get("artists") else "Unknown"),
+                "url": str(stream_url),
+                "title": str(track_info.get("title", "") or track_info.get("name", "Unknown")),
+                "thumbnail": str(track_info.get("cover", "") or track_info.get("image", "") or ""),
+                "artist": str(artist_name),
                 "duration": track_info.get("duration")
             }
             
             # Cache for 1 hour
             stream_cache[video_id] = {
                 'data': result,
-                'expires': time.time() + 3600
+                'expires': time.time() + CACHE_DURATION
             }
             
-            print(f"✅ Successfully extracted: {result['title']}")
+            print(f"✅ Stream URL extracted: {result['title']}")
             return result
             
     except HTTPException:
