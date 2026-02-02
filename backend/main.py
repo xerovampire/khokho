@@ -122,12 +122,16 @@ INVIDIOUS_INSTANCES = [
     "https://invidious.protokolla.fi"
 ]
 
-# Piped instances as backup
+# Piped instances as backup (updated working ones)
 PIPED_INSTANCES = [
     "https://pipedapi.kavin.rocks",
-    "https://api-piped.mha.fi",
-    "https://pipedapi.palveluntarjoaja.eu",
-    "https://piped-api.garudalinux.org"
+    "https://pipedapi-libre.kavin.rocks",
+    "https://api.piped.projectsegfau.lt",
+    "https://pipedapi.adminforge.de",
+    "https://pipedapi.in.projectsegfau.lt",
+    "https://pa.mint.lgbt",
+    "https://pa.il.ax",
+    "https://piped-api.privacy.com.de"
 ]
 
 async def get_stream_from_invidious(video_id: str):
@@ -267,49 +271,96 @@ def prepare_cookies_file():
 COOKIES_FILE = prepare_cookies_file()
 
 async def get_stream_from_ytdlp(video_id: str):
-    """Fallback to yt-dlp with optimized settings and cookies"""
-    try:
-        print(f"  ðŸ”§ Trying yt-dlp as last resort")
-        from yt_dlp import YoutubeDL
-        
-        url = f"https://www.youtube.com/watch?v={video_id}"
-        
-        ydl_opts = {
-            'format': 'bestaudio/best',
-            'quiet': True,
-            'no_warnings': True,
-            'noplaylist': True,
-            'extract_flat': False,
-            'extractor_args': {
-                'youtube': {
-                    'player_client': ['android_music', 'android', 'ios'],
-                    'player_skip': ['configs', 'webpage'],
-                }
-            },
-            'socket_timeout': 10,
+    """Fallback to yt-dlp with multiple client attempts"""
+    from yt_dlp import YoutubeDL
+    
+    url = f"https://www.youtube.com/watch?v={video_id}"
+    
+    # Try multiple client configurations
+    client_configs = [
+        {
+            'name': 'android_music',
+            'opts': {
+                'format': 'bestaudio/best',
+                'quiet': True,
+                'no_warnings': True,
+                'noplaylist': True,
+                'extract_flat': False,
+                'extractor_args': {
+                    'youtube': {
+                        'player_client': ['android_music'],
+                        'player_skip': ['webpage', 'configs'],
+                    }
+                },
+            }
+        },
+        {
+            'name': 'android',
+            'opts': {
+                'format': 'bestaudio/best',
+                'quiet': True,
+                'no_warnings': True,
+                'noplaylist': True,
+                'extractor_args': {
+                    'youtube': {
+                        'player_client': ['android'],
+                        'player_skip': ['webpage'],
+                    }
+                },
+            }
+        },
+        {
+            'name': 'ios',
+            'opts': {
+                'format': 'bestaudio/best',
+                'quiet': True,
+                'no_warnings': True,
+                'noplaylist': True,
+                'extractor_args': {
+                    'youtube': {
+                        'player_client': ['ios'],
+                    }
+                },
+            }
+        },
+        {
+            'name': 'web',
+            'opts': {
+                'format': 'bestaudio/best',
+                'quiet': True,
+                'no_warnings': True,
+                'noplaylist': True,
+            }
         }
-        
-        # Add cookies if available
-        if COOKIES_FILE:
-            ydl_opts['cookiefile'] = COOKIES_FILE
-            print(f"  ðŸª Using cookies from: {COOKIES_FILE}")
-        
-        with YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
+    ]
+    
+    for config in client_configs:
+        try:
+            print(f"  ðŸ”§ Trying yt-dlp with {config['name']} client")
             
-            if info and info.get('url'):
-                result = {
-                    "url": info.get('url'),
-                    "title": info.get('title'),
-                    "thumbnail": info.get('thumbnail'),
-                    "artist": info.get('uploader') or info.get('channel') or info.get('artist'),
-                    "duration": info.get('duration')
-                }
-                print(f"  âœ… Success with yt-dlp")
-                return result
+            ydl_opts = config['opts'].copy()
+            
+            # Add cookies if available
+            if COOKIES_FILE:
+                ydl_opts['cookiefile'] = COOKIES_FILE
+            
+            with YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=False)
                 
-    except Exception as e:
-        print(f"  âš ï¸  yt-dlp failed: {str(e)[:80]}")
+                if info and info.get('url'):
+                    result = {
+                        "url": info.get('url'),
+                        "title": info.get('title'),
+                        "thumbnail": info.get('thumbnail'),
+                        "artist": info.get('uploader') or info.get('channel') or info.get('artist'),
+                        "duration": info.get('duration')
+                    }
+                    print(f"  âœ… Success with yt-dlp ({config['name']})")
+                    return result
+                    
+        except Exception as e:
+            print(f"  âš ï¸  yt-dlp {config['name']}: {str(e)[:60]}")
+            continue
     
     return None
 
