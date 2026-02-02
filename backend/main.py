@@ -3,6 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 import httpx
 import uvicorn
 import time
+import os
 
 app = FastAPI()
 
@@ -15,141 +16,175 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# JioSaavn API Base URL
-JIOSAAVN_API = "https://ganduu-42p6jlfua-xerovampires-projects.vercel.app/api"
+# Amazon Music API - Production server
+AMAZON_MUSIC_API = os.getenv("AMAZON_MUSIC_API_URL", "https://amz.dezalty.com")
+# Auth token is optional - API works without auth for basic operations
+AMAZON_AUTH_TOKEN = os.getenv("AMAZON_AUTH_TOKEN", "")
 
-# Helper function to transform JioSaavn song to YouTube Music format
-def transform_song(saavn_song):
-    """Transform JioSaavn song format to match YouTube Music format"""
+# Helper function to transform Amazon Music data to YouTube Music format
+def transform_track(amz_track):
+    """Transform Amazon Music track format to match YouTube Music format"""
     return {
-        "videoId": saavn_song.get("id"),
-        "title": saavn_song.get("name") or saavn_song.get("title"),
-        "artists": [{"name": artist.get("name"), "id": artist.get("id")} 
-                   for artist in saavn_song.get("artists", {}).get("primary", [])],
+        "videoId": amz_track.get("id"),
+        "title": amz_track.get("title") or amz_track.get("name"),
+        "artists": [
+            {"name": artist.get("name"), "id": artist.get("id")} 
+            for artist in amz_track.get("artists", [])
+        ] if isinstance(amz_track.get("artists"), list) else [
+            {"name": amz_track.get("artist", "Unknown"), "id": None}
+        ],
         "album": {
-            "name": saavn_song.get("album", {}).get("name"),
-            "id": saavn_song.get("album", {}).get("id")
-        } if saavn_song.get("album") else None,
-        "duration": saavn_song.get("duration"),
-        "duration_seconds": saavn_song.get("duration"),
-        "thumbnails": [{"url": img.get("url"), "width": 0, "height": 0} 
-                      for img in saavn_song.get("image", [])],
-        "isExplicit": saavn_song.get("explicitContent", False),
-        "year": saavn_song.get("year")
+            "name": amz_track.get("album", {}).get("title") if isinstance(amz_track.get("album"), dict) else amz_track.get("album"),
+            "id": amz_track.get("album", {}).get("id") if isinstance(amz_track.get("album"), dict) else None
+        },
+        "duration": amz_track.get("duration"),
+        "duration_seconds": amz_track.get("duration"),
+        "thumbnails": [
+            {"url": amz_track.get("cover") or amz_track.get("image"), "width": 500, "height": 500}
+        ] if amz_track.get("cover") or amz_track.get("image") else [],
+        "isExplicit": amz_track.get("explicit", False),
+        "year": amz_track.get("year")
     }
 
 @app.get("/info")
 def info():
-    return {"status": "ok", "service": "Music Streamer Backend (JioSaavn)"}
+    return {"status": "ok", "service": "Music Streamer Backend (Amazon Music)"}
 
 @app.get("/search")
 async def search(q: str):
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
+        async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as client:
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+            }
+            if AMAZON_AUTH_TOKEN:
+                headers["Authorization"] = f"Bearer {AMAZON_AUTH_TOKEN}"
+            
+            # Amazon Music API search endpoint
             response = await client.get(
-                f"{JIOSAAVN_API}/search/songs",
-                params={"query": q, "limit": 20}
+                f"{AMAZON_MUSIC_API}/search",
+                params={"query": q, "type": "track"},
+                headers=headers
             )
             
+            print(f"Search API response status: {response.status_code}")
+            
             if response.status_code != 200:
-                raise HTTPException(status_code=500, detail="JioSaavn API error")
+                print(f"Amazon Music API error: {response.status_code}, body: {response.text[:200]}")
+                raise HTTPException(status_code=500, detail=f"Amazon Music API returned {response.status_code}")
             
             data = response.json()
+            print(f"Search response keys: {data.keys() if isinstance(data, dict) else 'not a dict'}")
             
-            if not data.get("success"):
+            # Handle different response formats
+            tracks = []
+            if isinstance(data, dict):
+                tracks = data.get("tracks", []) or data.get("results", []) or data.get("data", [])
+            elif isinstance(data, list):
+                tracks = data
+            
+            if not tracks:
+                print("No tracks found in response")
                 return []
             
-            # Transform to YouTube Music format
-            songs = data.get("data", {}).get("results", [])
-            return [transform_song(song) for song in songs]
+            print(f"Found {len(tracks)} tracks")
+            return [transform_track(track) for track in tracks[:20]]
             
+    except httpx.HTTPError as e:
+        print(f"HTTP Error in search: {e}")
+        raise HTTPException(status_code=503, detail="Amazon Music API unavailable")
     except Exception as e:
         print(f"Error in search: {e}")
+        import traceback
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/charts")
 async def get_charts():
     try:
-        # JioSaavn doesn't have a direct "charts" endpoint
-        # We'll use trending/popular searches as fallback
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            # Search for popular/trending terms
-            queries = ["Trending songs", "Top hits", "Popular music"]
-            all_songs = []
+        # Use trending/popular searches as "charts"
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            headers = {}
+            if AMAZON_AUTH_TOKEN:
+                headers["Authorization"] = f"Bearer {AMAZON_AUTH_TOKEN}"
+            
+            queries = ["Top 100", "Trending songs", "Popular hits"]
+            all_tracks = []
             
             for query in queries:
-                response = await client.get(
-                    f"{JIOSAAVN_API}/search/songs",
-                    params={"query": query, "limit": 10}
-                )
-                
-                if response.status_code == 200:
-                    data = response.json()
-                    if data.get("success"):
-                        songs = data.get("data", {}).get("results", [])
-                        all_songs.extend([transform_song(song) for song in songs])
-                
-                if len(all_songs) >= 20:
-                    break
+                try:
+                    response = await client.get(
+                        f"{AMAZON_MUSIC_API}/search",
+                        params={"query": query, "type": "track"},
+                        headers=headers
+                    )
+                    
+                    if response.status_code == 200:
+                        data = response.json()
+                        tracks = data.get("tracks", []) or data.get("results", []) or data.get("data", [])
+                        all_tracks.extend([transform_track(track) for track in tracks[:10]])
+                    
+                    if len(all_tracks) >= 20:
+                        break
+                except:
+                    continue
             
-            # Remove duplicates based on videoId
+            # Remove duplicates
             seen = set()
-            unique_songs = []
-            for song in all_songs:
-                if song["videoId"] not in seen:
-                    seen.add(song["videoId"])
-                    unique_songs.append(song)
+            unique_tracks = []
+            for track in all_tracks:
+                if track["videoId"] not in seen:
+                    seen.add(track["videoId"])
+                    unique_tracks.append(track)
             
-            return unique_songs[:20]
+            return unique_tracks[:20] if unique_tracks else []
             
     except Exception as e:
         print(f"Error in charts: {e}")
         return []
 
-# Simple in-memory cache: {song_id: {'url': ..., 'expires': timestamp}}
+# Simple in-memory cache
 stream_cache = {}
 
 @app.get("/suggestions")
 async def get_suggestions(q: str = ""):
     try:
         if not q:
-            # Return music categories
             return {
                 "queries": [],
                 "results": [
-                    {"title": "Bollywood", "color": "#8d67ab"},
-                    {"title": "Pop", "color": "#e8115b"},
-                    {"title": "Rock", "color": "#bc5906"},
-                    {"title": "Hip-Hop", "color": "#477d95"},
-                    {"title": "Classical", "color": "#1e3264"},
-                    {"title": "Electronic", "color": "#503750"}
+                    {"title": "Pop", "color": "#8d67ab"},
+                    {"title": "Rock", "color": "#e8115b"},
+                    {"title": "Hip-Hop", "color": "#bc5906"},
+                    {"title": "Electronic", "color": "#477d95"},
+                    {"title": "Jazz", "color": "#1e3264"},
+                    {"title": "Classical", "color": "#503750"}
                 ]
             }
         
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            # Get search results as suggestions
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            headers = {}
+            if AMAZON_AUTH_TOKEN:
+                headers["Authorization"] = f"Bearer {AMAZON_AUTH_TOKEN}"
+            
             response = await client.get(
-                f"{JIOSAAVN_API}/search/songs",
-                params={"query": q, "limit": 5}
+                f"{AMAZON_MUSIC_API}/search",
+                params={"query": q, "type": "track"},
+                headers=headers
             )
             
             if response.status_code != 200:
                 return {"queries": [], "results": []}
             
             data = response.json()
+            tracks = data.get("tracks", []) or data.get("results", []) or data.get("data", [])
             
-            if not data.get("success"):
-                return {"queries": [], "results": []}
-            
-            songs = data.get("data", {}).get("results", [])
-            transformed_songs = [transform_song(song) for song in songs]
-            
-            # Generate simple query suggestions
-            queries = [q, f"{q} songs", f"{q} hits", f"{q} music"][:3]
+            transformed_tracks = [transform_track(track) for track in tracks[:5]]
+            queries = [q, f"{q} songs", f"{q} hits"][:3]
             
             return {
                 "queries": queries,
-                "results": transformed_songs
+                "results": transformed_tracks
             }
             
     except Exception as e:
@@ -159,25 +194,28 @@ async def get_suggestions(q: str = ""):
 @app.get("/artist/{browse_id}")
 async def get_artist(browse_id: str):
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            response = await client.get(f"{JIOSAAVN_API}/artists/{browse_id}")
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            headers = {}
+            if AMAZON_AUTH_TOKEN:
+                headers["Authorization"] = f"Bearer {AMAZON_AUTH_TOKEN}"
+            
+            response = await client.get(
+                f"{AMAZON_MUSIC_API}/artist",
+                params={"id": browse_id},
+                headers=headers
+            )
             
             if response.status_code != 200:
                 raise HTTPException(status_code=404, detail="Artist not found")
             
             data = response.json()
+            artist = data.get("artist") or data.get("data") or data
             
-            if not data.get("success"):
-                raise HTTPException(status_code=404, detail="Artist not found")
-            
-            artist_data = data.get("data", {})
-            
-            # Transform to YouTube Music artist format
             return {
-                "name": artist_data.get("name"),
-                "description": artist_data.get("bio"),
-                "views": artist_data.get("followerCount"),
-                "thumbnails": [{"url": img.get("url")} for img in artist_data.get("image", [])],
+                "name": artist.get("name"),
+                "description": artist.get("bio") or artist.get("description"),
+                "views": artist.get("followers"),
+                "thumbnails": [{"url": artist.get("image") or artist.get("cover")}],
                 "songs": {"browseId": browse_id}
             }
             
@@ -190,20 +228,42 @@ async def get_artist(browse_id: str):
 @app.get("/related/{video_id}")
 async def get_related(video_id: str, limit: int = 20):
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            # Get song suggestions/recommendations
-            response = await client.get(f"{JIOSAAVN_API}/songs/{video_id}/suggestions")
+        # Amazon Music API might not have a direct "related" endpoint
+        # Try to get similar tracks based on the current track's artist/genre
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            headers = {}
+            if AMAZON_AUTH_TOKEN:
+                headers["Authorization"] = f"Bearer {AMAZON_AUTH_TOKEN}"
             
-            if response.status_code != 200:
-                return []
+            # First get the track details
+            track_response = await client.get(
+                f"{AMAZON_MUSIC_API}/track",
+                params={"id": video_id},
+                headers=headers
+            )
             
-            data = response.json()
+            if track_response.status_code == 200:
+                track_data = track_response.json()
+                track = track_data.get("track") or track_data.get("data") or track_data
+                
+                # Search for similar tracks by artist
+                artist_name = track.get("artist") or (track.get("artists", [{}])[0].get("name") if track.get("artists") else "")
+                
+                if artist_name:
+                    search_response = await client.get(
+                        f"{AMAZON_MUSIC_API}/search",
+                        params={"query": artist_name, "type": "track"},
+                        headers=headers
+                    )
+                    
+                    if search_response.status_code == 200:
+                        data = search_response.json()
+                        tracks = data.get("tracks", []) or data.get("results", []) or data.get("data", [])
+                        related = [transform_track(t) for t in tracks[:limit]]
+                        # Filter out the current track
+                        return [t for t in related if t["videoId"] != video_id][:limit]
             
-            if not data.get("success"):
-                return []
-            
-            songs = data.get("data", [])[:limit]
-            return [transform_song(song) for song in songs]
+            return []
             
     except Exception as e:
         print(f"Error getting related tracks: {e}")
@@ -221,60 +281,66 @@ async def get_stream_url(video_id: str):
             else:
                 del stream_cache[video_id]
 
-        print(f"🎵 Fetching song: {video_id}")
+        print(f"🎵 Fetching track: {video_id}")
         
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            # Get song details including download URLs
-            response = await client.get(f"{JIOSAAVN_API}/songs/{video_id}")
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            headers = {}
+            if AMAZON_AUTH_TOKEN:
+                headers["Authorization"] = f"Bearer {AMAZON_AUTH_TOKEN}"
+            
+            # Get streaming URLs
+            response = await client.get(
+                f"{AMAZON_MUSIC_API}/stream_urls",
+                params={"id": video_id},
+                headers=headers
+            )
             
             if response.status_code != 200:
-                raise HTTPException(status_code=404, detail="Song not found")
+                raise HTTPException(status_code=404, detail="Track not found or streaming unavailable")
             
             data = response.json()
             
-            if not data.get("success"):
-                raise HTTPException(status_code=404, detail="Song not found")
+            # Get track metadata
+            track_response = await client.get(
+                f"{AMAZON_MUSIC_API}/track",
+                params={"id": video_id},
+                headers=headers
+            )
             
-            song = data.get("data", [{}])[0]
+            track_info = {}
+            if track_response.status_code == 200:
+                track_data = track_response.json()
+                track_info = track_data.get("track") or track_data.get("data") or track_data
             
-            # Get the best quality download URL
-            download_urls = song.get("downloadUrl", [])
-            if not download_urls:
+            # Extract the best quality stream URL
+            # Format depends on the actual API response
+            stream_url = None
+            urls = data.get("urls") or data.get("stream_urls") or data
+            
+            # Try different quality levels
+            for quality in ["High", "Normal", "Medium"]:
+                if isinstance(urls, dict) and quality in urls:
+                    stream_url = urls[quality]
+                    break
+            
+            if not stream_url and isinstance(urls, list) and urls:
+                stream_url = urls[0] if isinstance(urls[0], str) else urls[0].get("url")
+            
+            if not stream_url:
                 raise HTTPException(status_code=404, detail="No stream URL available")
             
-            # Sort by quality (320kbps > 160kbps > 96kbps > 48kbps > 12kbps)
-            quality_priority = {"320kbps": 5, "160kbps": 4, "96kbps": 3, "48kbps": 2, "12kbps": 1}
-            best_quality = max(download_urls, key=lambda x: quality_priority.get(x.get("quality", ""), 0))
-            
-            # Get thumbnail URL (best quality)
-            thumbnails = song.get("image", [])
-            thumbnail_url = None
-            if thumbnails:
-                # Try to get highest quality
-                for quality in ["500x500", "150x150", "50x50"]:
-                    thumb = next((t for t in thumbnails if quality in t.get("quality", "")), None)
-                    if thumb:
-                        thumbnail_url = thumb.get("url")
-                        break
-                if not thumbnail_url and thumbnails:
-                    thumbnail_url = thumbnails[-1].get("url")
-            
-            # Get artist names
-            artists = song.get("artists", {}).get("primary", [])
-            artist_name = artists[0].get("name") if artists else "Unknown Artist"
-            
             result = {
-                "url": best_quality.get("url"),
-                "title": song.get("name"),
-                "thumbnail": thumbnail_url,
-                "artist": artist_name,
-                "duration": song.get("duration")
+                "url": stream_url,
+                "title": track_info.get("title") or track_info.get("name", "Unknown"),
+                "thumbnail": track_info.get("cover") or track_info.get("image"),
+                "artist": track_info.get("artist") or (track_info.get("artists", [{}])[0].get("name") if track_info.get("artists") else "Unknown"),
+                "duration": track_info.get("duration")
             }
             
-            # Cache for 2 hours (JioSaavn URLs are more stable than YouTube)
+            # Cache for 1 hour
             stream_cache[video_id] = {
                 'data': result,
-                'expires': time.time() + 7200
+                'expires': time.time() + 3600
             }
             
             print(f"✅ Successfully extracted: {result['title']}")
@@ -289,4 +355,5 @@ async def get_stream_url(video_id: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    port = int(os.getenv("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
